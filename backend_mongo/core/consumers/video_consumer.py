@@ -5,6 +5,7 @@ from channels.generic.websocket import AsyncWebsocketConsumer
 import json
 from bson import ObjectId
 import os
+from collections import Counter
 from ultralytics import YOLO
 from core.models.product import Product
 from core.utils.response import convert_mongo_types
@@ -25,6 +26,7 @@ class VideoStreamConsumer(AsyncWebsocketConsumer):
         pass
 
     async def receive(self, text_data):
+        print("dapat frame")
         data = json.loads(text_data)
         frame_b64 = data.get("frame")
         if not frame_b64:
@@ -53,7 +55,7 @@ class VideoStreamConsumer(AsyncWebsocketConsumer):
             if not track.is_confirmed():
                 continue
             track_id = track.track_id
-            class_id = track.get_det_class()  # Optional: if DeepSort supports this or store manually
+            class_id = track.get_det_class()  # Optional: jika DeepSort mendukung ini
             product_name = model.names[class_id]
             try:
                 object_id = ObjectId(product_name.strip())
@@ -64,11 +66,20 @@ class VideoStreamConsumer(AsyncWebsocketConsumer):
 
         print("Product IDs:", product_ids)
 
+        # Menghitung jumlah kemunculan setiap ID produk
+        counts = Counter(str(pid) for pid in product_ids)
+
         products = Product.objects(id__in=product_ids)
         result = [p.to_mongo().to_dict() for p in products]
+        result = convert_mongo_types(result)
+
+        # Menambahkan field quantity ke setiap produk
+        for item in result:
+            item_id = item.get('_id')
+            item['quantity'] = counts.get(str(item_id), 0)
 
         await self.send(text_data=json.dumps({
             "message": "Product Detected",
             "status": 200,
-            "data": convert_mongo_types(result)
+            "data": result
         }))
