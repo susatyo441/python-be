@@ -1,85 +1,161 @@
-import base64
-import cv2
-import numpy as np
-from channels.generic.websocket import AsyncWebsocketConsumer
-import json
-from bson import ObjectId
-import os
-from collections import Counter
+import os, json, base64, cv2, numpy as np
 from ultralytics import YOLO
+from channels.generic.websocket import AsyncWebsocketConsumer
+from bson import ObjectId
 from core.models.product import Product
 from core.utils.response import convert_mongo_types
-from deep_sort_realtime.deepsort_tracker import DeepSort
+import mediapipe as mp
+from datetime import datetime
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-model_path = os.path.join(BASE_DIR, "best11x2.pt")
-model = YOLO(model_path)
-# Tambahkan ini di awal file atau dalam __init__ jika kamu buatnya kelas stateful
-tracker = DeepSort(max_age=15, n_init=2)  # max_age = berapa banyak frame objek boleh 'hilang'
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+model_path  = os.path.join(BASE_DIR, "modeln2.pt")
+yaml_path   = os.path.join(BASE_DIR, "test.yaml")
+MISS_TOLERANCE = 5
+
+mp_hands = mp.solutions.hands
+hands    = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=2,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
 
 class VideoStreamConsumer(AsyncWebsocketConsumer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.prev_tracks        = {}
+        self.last_seen          = {}
+        self.detected_track_ids = set()
+        self.product_counts     = {}
+        self.frame_count        = 0
+        self.model              = None
+        self.frame_folder       = None
+        self.product_cache = {}  # cache: label -> product_data tanpa quantity
+
+
     async def connect(self):
         await self.accept()
+        self.model = YOLO(model_path)
+
+        # Buat folder baru utk sesi ini
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.frame_folder = os.path.join(BASE_DIR, f"session_{ts}")
+        os.makedirs(self.frame_folder, exist_ok=True)
+        print(f"[VideoStreamConsumer] Saving frames to {self.frame_folder}")
+
         await self.send(json.dumps({"message": "connected"}))
 
     async def disconnect(self, close_code):
+        # nothing to clean up here for images
         pass
 
+    async def process_frame(self, frame):
+        self.frame_count += 1
+
+        # 1. (opsional) Hand skip
+        # rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # if hands.process(rgb).multi_hand_landmarks:
+        #     self.prev_tracks = {}
+        #     return {"status": "hand_detected"}
+
+        # 2. Deteksi & tracking
+        results = self.model.track(
+            frame, persist=True,
+            conf=0.85, iou=0.15,
+            tracker=yaml_path
+        )
+
+        current = {}
+        for res in results:
+            for box in res.boxes:
+                if box.id is None: continue
+                tid = int(box.id[0])
+                lbl = self.model.names[int(box.cls[0])]
+                current[tid] = lbl
+
+                # gambar bounding box + label
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
+                cv2.putText(frame, f"{lbl}-{tid}",
+                            (x1, y1-6),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5, (0,255,0), 1)
+
+        # 3. Konfirmasi dua-frame
+        if self.frame_count > 2:
+            confirmed = {
+                tid: lbl for tid,lbl in current.items()
+                if tid in self.prev_tracks
+            }
+        else:
+            confirmed = current
+
+        # 4. Hitung dengan miss-tolerance
+        for tid, lbl in confirmed.items():
+            last = self.last_seen.get(tid)
+            if last is None or (self.frame_count - last) > MISS_TOLERANCE:
+                self.product_counts[lbl] = self.product_counts.get(lbl, 0) + 1
+            self.last_seen[tid] = self.frame_count
+
+        self.prev_tracks = current.copy()
+
+        # 5. Overlay counter
+        y0 = 20
+        for prod, cnt in self.product_counts.items():
+            cv2.putText(frame, f"{prod}: {cnt}",
+                        (10, y0),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (255,0,0), 2)
+            y0 += 25
+
+        # 6. Simpan frame ke folder sesi
+        frame_path = os.path.join(
+            self.frame_folder,
+            f"frame_{self.frame_count:05d}.jpg"
+        )
+        cv2.imwrite(frame_path, frame)
+
+        # 7. Siapkan data utk response
+        # 7. Siapkan data utk response, dengan cache
+        products = []
+        for lbl, cnt in self.product_counts.items():
+            if lbl not in self.product_cache:
+                try:
+                    prod = Product.objects.get(id=ObjectId(lbl))
+                    data = prod.to_mongo().to_dict()
+                    # simpan tanpa quantity
+                    self.product_cache[lbl] = data
+                except Product.DoesNotExist:
+                    # jika gagal ambil dari DB, skip dan jangan cache
+                    continue
+
+            # salin template data dan tambahkan quantity
+            entry = self.product_cache[lbl].copy()
+            entry["quantity"] = cnt
+            products.append(entry)
+
+        return {"status": "success", "products": convert_mongo_types(products)}
+
+
     async def receive(self, text_data):
-        print("dapat frame")
-        data = json.loads(text_data)
+        data      = json.loads(text_data)
         frame_b64 = data.get("frame")
         if not frame_b64:
             return
 
-        frame_data = base64.b64decode(frame_b64)
-        np_arr = np.frombuffer(frame_data, np.uint8)
-        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        buf   = base64.b64decode(frame_b64)
+        arr   = np.frombuffer(buf, np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
-        # YOLO Detection
-        results = model(frame)
-        detections = []
-        print("Detected classes:", [model.names[int(c)] for r in results for c in r.boxes.cls])
-        
-        for r in results:
-            for box in r.boxes:
-                cls_id = int(box.cls)
-                conf = float(box.conf)
-                x1, y1, x2, y2 = map(int, box.xyxy[0])  # assuming box format is xyxy
-                detections.append(([x1, y1, x2 - x1, y2 - y1], conf, cls_id))
-
-        tracks = tracker.update_tracks(detections, frame=frame)
-
-        product_ids = []
-        for track in tracks:
-            if not track.is_confirmed():
-                continue
-            track_id = track.track_id
-            class_id = track.get_det_class()  # Optional: jika DeepSort mendukung ini
-            product_name = model.names[class_id]
-            try:
-                object_id = ObjectId(product_name.strip())
-                product = Product.objects.get(id=object_id)
-                product_ids.append(product.pk)
-            except Exception as e:
-                print(f"Track {track_id}: failed to fetch product: {e}")
-
-        print("Product IDs:", product_ids)
-
-        # Menghitung jumlah kemunculan setiap ID produk
-        counts = Counter(str(pid) for pid in product_ids)
-
-        products = Product.objects(id__in=product_ids)
-        result = [p.to_mongo().to_dict() for p in products]
-        result = convert_mongo_types(result)
-
-        # Menambahkan field quantity ke setiap produk
-        for item in result:
-            item_id = item.get('_id')
-            item['quantity'] = counts.get(str(item_id), 0)
-
-        await self.send(text_data=json.dumps({
-            "message": "Product Detected",
-            "status": 200,
-            "data": result
-        }))
+        result = await self.process_frame(frame)
+        if result["status"] == "hand_detected":
+            await self.send(json.dumps({
+                "message": "Hand Detected - Frame Skipped",
+                "status": 200
+            }))
+        else:
+            await self.send(json.dumps({
+                "message": "Product Detected",
+                "status": 200,
+                "data": result["products"]
+            }))
