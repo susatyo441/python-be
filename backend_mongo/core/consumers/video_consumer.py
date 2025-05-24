@@ -5,7 +5,7 @@ from bson import ObjectId
 from core.models.product import Product
 from core.utils.response import convert_mongo_types
 import mediapipe as mp
-from datetime import datetime
+# from datetime import datetime
 
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 model_path  = os.path.join(BASE_DIR, "modeln2.pt")
@@ -29,8 +29,8 @@ class VideoStreamConsumer(AsyncWebsocketConsumer):
         self.product_counts     = {}
         self.frame_count        = 0
         self.model              = None
-        self.frame_folder       = None
-        self.product_cache = {}  # cache: label -> product_data tanpa quantity
+        # self.frame_folder       = None
+        self.product_cache = {}  
 
 
     async def connect(self):
@@ -38,10 +38,10 @@ class VideoStreamConsumer(AsyncWebsocketConsumer):
         self.model = YOLO(model_path)
 
         # Buat folder baru utk sesi ini
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.frame_folder = os.path.join(BASE_DIR, f"session_{ts}")
-        os.makedirs(self.frame_folder, exist_ok=True)
-        print(f"[VideoStreamConsumer] Saving frames to {self.frame_folder}")
+        # ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # self.frame_folder = os.path.join(BASE_DIR, f"session_{ts}")
+        # os.makedirs(self.frame_folder, exist_ok=True)
+        # print(f"[VideoStreamConsumer] Saving frames to {self.frame_folder}")
 
         await self.send(json.dumps({"message": "connected"}))
 
@@ -109,13 +109,12 @@ class VideoStreamConsumer(AsyncWebsocketConsumer):
             y0 += 25
 
         # 6. Simpan frame ke folder sesi
-        frame_path = os.path.join(
-            self.frame_folder,
-            f"frame_{self.frame_count:05d}.jpg"
-        )
-        cv2.imwrite(frame_path, frame)
+        # frame_path = os.path.join(
+        #     self.frame_folder,
+        #     f"frame_{self.frame_count:05d}.jpg"
+        # )
+        # cv2.imwrite(frame_path, frame)
 
-        # 7. Siapkan data utk response
         # 7. Siapkan data utk response, dengan cache
         products = []
         for lbl, cnt in self.product_counts.items():
